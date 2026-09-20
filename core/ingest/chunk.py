@@ -16,6 +16,17 @@ def normalize(text: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"(\w)-\s+(\w)", r"\1-\2", text)).strip()
 
 
+def appendix_heading(text: str) -> re.Match[str] | None:
+    match = APPENDIX.match(text)
+    if match and (
+        len(text) < 150
+        and not re.search(r"[.!?]$|\b(?:shall|must|will)\b", text, re.I)
+        and not re.match(r"\s+[a-z]", text[match.end():])
+    ):
+        return match
+    return None
+
+
 def chunk_blocks(blocks: list[SourceBlock], max_chars: int = 2400) -> list[Chunk]:
     chunks: list[Chunk] = []
     section = exhibit = heading = None
@@ -24,11 +35,12 @@ def chunk_blocks(blocks: list[SourceBlock], max_chars: int = 2400) -> list[Chunk
         text = normalize(block.text)
         if not text:
             continue
-        appendix = APPENDIX.match(text) if block.kind != "table_row" else None
+        appendix = appendix_heading(text) if block.kind != "table_row" else None
         numbered = SECTION.match(text) if block.kind != "table_row" else None
         if appendix:
             exhibit, section, heading = appendix[1], None, text
         elif numbered:
+            exhibit = None
             section = (numbered["explicit"] or numbered["numbered"]).rstrip(".)")
             heading = numbered["title"].split(". ", 1)[0][:180]
         elif block.kind == "heading":
@@ -51,7 +63,8 @@ def chunk_blocks(blocks: list[SourceBlock], max_chars: int = 2400) -> list[Chunk
         prefix = (
             f"risk:{exhibit}:{requirement_id}" if risk and requirement_id and exhibit else
             f"p{block.page}:risk:{requirement_id}" if risk and requirement_id else
-            f"exh:{exhibit or '?'}:{requirement_id}" if requirement_id else
+            f"exh:{exhibit}:{requirement_id}" if requirement_id and exhibit else
+            f"p{block.page}:requirement:{requirement_id}" if requirement_id else
             f"sec:{section}" if section and kind == "clause" else
             f"p{block.page}:block:{len(chunks) + 1}"
         )

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pdfplumber
 
-from core.ingest.chunk import APPENDIX, IDENTIFIER, SECTION, chunk_blocks, normalize
+from core.ingest.chunk import APPENDIX, IDENTIFIER, SECTION, appendix_heading, chunk_blocks, normalize
 from core.models import ParsedDocument, SourceBlock
 
 TABLE_SETTINGS = {"vertical_strategy": "lines", "horizontal_strategy": "lines"}
@@ -62,14 +62,16 @@ def _page_blocks(page, page_number: int) -> tuple[list[SourceBlock], list[str]]:
         else:
             lines[-1].append(word)
     paragraphs: list[list[dict]] = []
+    after_appendix_heading = False
     for line in lines:
         line.sort(key=lambda w: w["x0"])
         text = " ".join(w["text"] for w in line)
         boundary = SECTION.match(text) or APPENDIX.match(text) or re.match(r"^[A-Z]+\d+\.\s", text)
-        if not paragraphs or boundary or line[0]["top"] - max(w["bottom"] for w in paragraphs[-1]) > 9:
+        if not paragraphs or boundary or after_appendix_heading or line[0]["top"] - max(w["bottom"] for w in paragraphs[-1]) > 9:
             paragraphs.append(list(line))
         else:
             paragraphs[-1].extend(line)
+        after_appendix_heading = appendix_heading(text) is not None
     gutter_lines = 0
     for line in lines:
         for left, right in zip(line, line[1:]):

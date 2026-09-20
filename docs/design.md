@@ -22,8 +22,14 @@ An ID is never required to retain or retrieve a row. Sections are not restricted
 to the sample's numbers and exhibits are not restricted to A-H.
 Risk row IDs carry their document-derived exhibit as `risk:<exhibit>:<id>`.
 Without an exhibit, identified risk rows use `p<page>:risk:<id>` and citations
-fall back to the page. Historical results prefer saved source metadata; legacy
-IDs lacking location metadata are not assigned an invented exhibit.
+fall back to the page; other identified rows use `p<page>:requirement:<id>`
+instead of inventing an exhibit. Only short, standalone heading-like blocks
+start exhibit scope, not paragraphs opening with an inline appendix reference.
+PDF extraction keeps these headings separate from following prose.
+Numbered body sections clear exhibit scope. Section metadata takes precedence
+over stale exhibit metadata in historical snapshots. Historical results prefer
+saved source metadata; ID-only citations omit trailing `:partN` split markers,
+and legacy IDs lacking location metadata are not assigned an invented exhibit.
 
 Long blocks are split into bounded contiguous slices. Context reads restore the
 parent clause or table. Repeated table headers can link adjacent-page fragments.

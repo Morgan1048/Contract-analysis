@@ -23,6 +23,8 @@ def reference_label(chunk: Any) -> str:
     "Exhibit G13 (NET-01)". Public so the UI can render the same label for
     citations sourced outside ``to_compliance_json`` (e.g. chat tool results).
     """
+    if chunk.section_id:
+        return f"Section {chunk.section_id}"
     if chunk.exhibit_id:
         label_id = chunk.exhibit_id
         if chunk.heading:
@@ -36,13 +38,12 @@ def reference_label(chunk: Any) -> str:
         if chunk.requirement_id:
             label += f" ({chunk.requirement_id})"
         return label
-    if chunk.section_id:
-        return f"Section {chunk.section_id}"
     return f"Page {chunk.page}"
 
 
 def reference_label_from_chunk_id(chunk_id: str) -> str:
     """Best available citation label when only persisted finding data exists."""
+    chunk_id = re.sub(r":part\d+$", "", chunk_id)
     if chunk_id.startswith("sec:"):
         return f"Section {chunk_id.removeprefix('sec:')}"
     if chunk_id.startswith("exh:"):
@@ -51,7 +52,7 @@ def reference_label_from_chunk_id(chunk_id: str) -> str:
         if len(parts) > 2 and parts[2]:
             label += f" ({parts[2]})"
         return label
-    risk = re.fullmatch(r"risk:([A-Za-z0-9]+):([^:]+)(?::part\d+)?", chunk_id)
+    risk = re.fullmatch(r"risk:([A-Za-z0-9]+):([^:]+)", chunk_id)
     if risk:
         return f"Exhibit {risk[1]} ({risk[2]})"
     page = re.match(r"p(\d+):", chunk_id)
