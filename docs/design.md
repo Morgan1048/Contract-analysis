@@ -26,6 +26,8 @@ parent clause or table. Repeated table headers can link adjacent-page fragments.
 Page/bounding-box metadata remains on each physical fragment. Retrieval-enriched
 text includes headings/headers; quotations must match source text, not enrichment.
 Whitespace normalization is allowed, but verification does not erase word boundaries.
+Cross-reference keywords are case-insensitive; labels match uppercase letters and
+digits (including dotted section numbers), not lowercase prose after a keyword.
 
 This release supports text-extractable PDFs. Image-only pages and embedded images
 requiring interpretation are explicit review conditions; there is no OCR/VLM
@@ -173,6 +175,11 @@ the uploaded document. The assignment and sample must use local providers.
 Operational KPIs: P50/P95 latency, node durations, LLM/tool calls, token usage,
 estimated LLM plus embedding API costs, completion/review rates, quote-verification
 attempt failures, follow-up resolution yield and budget exhaustion.
+
+Latency P50/P95 and the seven-day cost median use the same linear interpolation
+between sorted observations at `pct * (n - 1)` (empty inputs return zero).
+Model pricing prefers exact keys, then the longest unqualified substring match,
+so dated model IDs inherit their most specific base model's rates.
 
 Quote validation measures provenance, not semantic faithfulness. NOT_FOUND and
 compliance distributions are diagnostics/business outcomes, not model accuracy.
