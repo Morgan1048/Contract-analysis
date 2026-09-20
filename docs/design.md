@@ -20,6 +20,10 @@ borderless table recognition is conservative and heuristic. `chunk.py` assigns
 document-derived sections/appendices, parent relationships and optional IDs.
 An ID is never required to retain or retrieve a row. Sections are not restricted
 to the sample's numbers and exhibits are not restricted to A-H.
+Risk row IDs carry their document-derived exhibit as `risk:<exhibit>:<id>`.
+Without an exhibit, identified risk rows use `p<page>:risk:<id>` and citations
+fall back to the page. Historical results prefer saved source metadata; legacy
+IDs lacking location metadata are not assigned an invented exhibit.
 
 Long blocks are split into bounded contiguous slices. Context reads restore the
 parent clause or table. Repeated table headers can link adjacent-page fragments.

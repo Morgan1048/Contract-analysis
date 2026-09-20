@@ -1,0 +1,278 @@
+openapi: 3.1.0
+info:
+  title: Contract Analyzer Connector
+  version: 2.0.0
+  description: >
+    Proposed REST connector, NOT an implemented HTTP service. The executable
+    connector is MCP stdio (mcp_server.py); it uses the same public result
+    serializer as the UI. Contract v2 requires run-scoped retrieval and replaces
+    the old MCP simplified question response with the public AnalysisResult.
+servers:
+  - url: http://localhost:8000
+security:
+  - TenantApiKey: []
+paths:
+  /analyze:
+    post:
+      operationId: analyzeContract
+      x-required-scopes: [runs:write]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                allow_remote:
+                  type: boolean
+                  default: false
+                  description: Explicit authorization for non-confidential input only.
+                assessment_date:
+                  type: string
+                  format: date
+      responses:
+        "202":
+          description: Analysis accepted; poll the returned run identifier.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RunAccepted"
+        "400":
+          $ref: "#/components/responses/UnparseableDocument"
+        "503":
+          $ref: "#/components/responses/BackendUnavailable"
+  /runs/{run_id}:
+    get:
+      operationId: getComplianceResult
+      x-required-scopes: [runs:read]
+      parameters:
+        - $ref: "#/components/parameters/RunId"
+      responses:
+        "200":
+          description: Public result, running status (with optional wait), or terminal job failure.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RunResponse"
+        "404":
+          $ref: "#/components/responses/RunNotFound"
+  /runs:
+    get:
+      operationId: listRuns
+      x-required-scopes: [runs:read]
+      responses:
+        "200":
+          description: Historical analysis runs.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/RunSummary"
+  /search:
+    post:
+      operationId: searchContract
+      x-required-scopes: [contracts:search]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SearchRequest"
+      responses:
+        "200":
+          description: Ranked evidence chunks.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SearchResponse"
+  /chat:
+    post:
+      operationId: chat
+      x-required-scopes: [chat:write]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatRequest"
+      responses:
+        "200":
+          description: Chat answer with cited evidence.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatResponse"
+components:
+  securitySchemes:
+    TenantApiKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: Per-tenant key; the proposed hosted connector must enforce each operation's x-required-scopes.
+  parameters:
+    RunId:
+      name: run_id
+      in: path
+      required: true
+      schema: {type: string}
+  schemas:
+    RunAccepted:
+      type: object
+      additionalProperties: false
+      required: [run_id, status]
+      properties:
+        run_id: {type: string}
+        status: {type: string, enum: [running]}
+    RunResponse:
+      oneOf:
+        - $ref: "#/components/schemas/RunStatus"
+        - $ref: "#/components/schemas/RunFailure"
+        - $ref: "#/components/schemas/AnalysisResult"
+    RunStatus:
+      type: object
+      additionalProperties: false
+      required: [run_id, status]
+      properties:
+        run_id: {type: string}
+        status: {type: string, enum: [running]}
+        wait:
+          $ref: "#/components/schemas/WaitStatus"
+    WaitStatus:
+      type: object
+      additionalProperties: false
+      required: [provider, model, reason, remaining_s, retry, max_retries, http_status, phase]
+      properties:
+        provider: {type: string}
+        model: {type: string}
+        reason: {type: string, enum: [rate_limit, quota_reset, request_pacing, server_retry, network_retry]}
+        remaining_s: {type: number, minimum: 0}
+        retry: {type: integer, minimum: 0}
+        max_retries: {type: integer, minimum: 0}
+        http_status: {type: [integer, "null"]}
+        phase: {type: string, enum: [waiting, blocked]}
+    RunFailure:
+      type: object
+      additionalProperties: false
+      required: [run_id, status, error, code]
+      properties:
+        run_id: {type: string}
+        status: {type: string, enum: [failed]}
+        error: {type: string}
+        code: {type: string, enum: [ANALYSIS_FAILED, BACKEND_UNAVAILABLE]}
+    AnalysisResult:
+      type: object
+      additionalProperties: false
+      required: [run_id, source_path, started_at, finished_at, status, questions]
+      properties:
+        run_id: {type: string}
+        source_path: {type: string}
+        started_at: {type: string, format: date-time}
+        finished_at: {type: string, format: date-time}
+        status: {type: string, enum: [completed, incomplete]}
+        questions:
+          type: array
+          maxItems: 5
+          items:
+            $ref: "#/components/schemas/ComplianceQuestion"
+        review_required:
+          type: array
+          items: {type: object}
+        check_results:
+          type: array
+          items: {type: object}
+        audit: {type: object}
+    ComplianceQuestion:
+      type: object
+      additionalProperties: false
+      required: [Compliance Question, Compliance State, Confidence, Relevant Quotes, Rationale]
+      properties:
+        Compliance Question: {type: string}
+        Compliance State:
+          type: string
+          enum: [Fully Compliant, Partially Compliant, Non-Compliant]
+        Confidence: {type: number, minimum: 0, maximum: 1}
+        Relevant Quotes:
+          type: array
+          items:
+            $ref: "#/components/schemas/Citation"
+        Rationale: {type: string}
+    Citation:
+      type: object
+      additionalProperties: false
+      required: [quote, citation, source_chunk_id]
+      properties:
+        quote: {type: string}
+        citation: {type: string}
+        source_chunk_id: {type: string}
+    RunSummary:
+      type: object
+      additionalProperties: true
+      properties:
+        run_id: {type: string}
+        status: {type: string}
+    SearchRequest:
+      type: object
+      required: [run_id, query]
+      properties:
+        run_id:
+          type: string
+          description: Exact run whose contract to query; never defaults to the latest run.
+        query: {type: string}
+        k: {type: integer, default: 6}
+        kinds:
+          type: array
+          items: {type: string}
+    SearchResponse:
+      type: object
+      required: [found, run_id]
+      properties:
+        run_id: {type: string}
+        found: {type: boolean}
+        error: {type: string}
+        code: {type: string}
+        source_required: {type: boolean}
+        results:
+          type: array
+          items: {type: object, additionalProperties: true}
+    ChatRequest:
+      type: object
+      required: [session_id, run_id, message]
+      properties:
+        session_id: {type: string}
+        run_id: {type: string}
+        message: {type: string}
+    ChatResponse:
+      type: object
+      required: [answer, citations]
+      properties:
+        answer: {type: string}
+        citations:
+          type: array
+          items: {$ref: "#/components/schemas/Citation"}
+    Error:
+      type: object
+      required: [error, code]
+      properties:
+        error: {type: string}
+        code: {type: string}
+  responses:
+    UnparseableDocument:
+      description: The uploaded document could not be parsed.
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+    BackendUnavailable:
+      description: The analysis backend is unavailable.
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}
+    RunNotFound:
+      description: No run exists for this identifier.
+      content:
+        application/json:
+          schema: {$ref: "#/components/schemas/Error"}

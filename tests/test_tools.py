@@ -158,7 +158,7 @@ def test_list_deviations_returns_open_risk_acceptance(tmp_path):
     assert result["found"] is True
     by_id = {item["risk_id"]: item for item in result["deviations"]}
     assert by_id["RA-2026-001"]["status"] == "Open"
-    assert by_id["RA-2026-001"]["chunk_id"] == "risk:RA-2026-001"
+    assert by_id["RA-2026-001"]["chunk_id"] == "risk:H:RA-2026-001"
 
 
 # 7. get_compliance_result reads a stored run back from the run store
