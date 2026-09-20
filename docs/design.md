@@ -31,6 +31,9 @@ This release supports text-extractable PDFs. Image-only pages and embedded image
 requiring interpretation are explicit review conditions; there is no OCR/VLM
 fallback pretending to have read them. Complex multi-column/merged-cell layouts
 remain a limitation, not a claimed universal parsing capability.
+Embedded images and uncertain reading order still emit page-specific warnings,
+but do not mark otherwise readable pages unreadable. Pages without extracted
+blocks, or with images and fewer than 40 text characters, remain unreadable.
 
 Indexes are keyed by structural representation/version and embedder identity.
 Real lexical/vector retrieval is fused; an unavailable embedding backend is an

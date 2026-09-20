@@ -31,6 +31,38 @@ def make_index(tmp_path, *, renumber=False):
     return path, ChunkIndex(doc, VectorStore(FakeEmbedder(), tmp_path / "index"))
 
 
+def write_image_pdf(path, text):
+    content = (f"BT /F1 11 Tf 72 700 Td ({text}) Tj ET\n"
+               "q 10 0 0 10 72 740 cm /Im1 Do Q\n").encode("ascii")
+    image = bytes([255, 0, 0])
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Font << /F1 4 0 R >> /XObject << /Im1 6 0 R >> >> /Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        f"<< /Length {len(content)} >>\nstream\n".encode("ascii") + content + b"endstream",
+        b"<< /Type /XObject /Subtype /Image /Width 1 /Height 1 "
+        b"/ColorSpace /DeviceRGB /BitsPerComponent 8 /Length 3 >>\nstream\n" + image + b"\nendstream",
+    ]
+    output = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for number, obj in enumerate(objects, 1):
+        offsets.append(len(output))
+        output.extend(f"{number} 0 obj\n".encode("ascii") + obj + b"\nendobj\n")
+    xref_offset = len(output)
+    output.extend(f"xref\n0 {len(objects) + 1}\n".encode("ascii"))
+    output.extend(b"0000000000 65535 f \n")
+    for offset in offsets:
+        output.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
+    output.extend(
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
+        f"startxref\n{xref_offset}\n%%EOF\n".encode("ascii")
+    )
+    path.write_bytes(output)
+    return path
+
+
 def test_rubric_is_document_independent():
     questions = load_rubric()
     checks = [s for q in questions.values() for s in q.sub_requirements]
@@ -414,8 +446,43 @@ def test_ambiguous_columns_are_flagged_instead_of_silently_interleaved(tmp_path)
     path = tmp_path / "columns.pdf"
     _write_text_pdf(["Independent layout"], path, drawing_commands=commands)
     doc = parse_pdf(path)
+    assert doc.unreadable_pages == []
+    assert "Left prose" in doc.text and "Right prose" in doc.text
+    assert doc.chunks
+    assert any("Page 1:" in warning and "reading order" in warning for warning in doc.warnings)
+
+
+def test_embedded_image_does_not_make_readable_page_unreadable(tmp_path):
+    text = "42. Delivery terms. Every dispatched carton must be sealed before carrier collection."
+    doc = parse_pdf(write_image_pdf(tmp_path / "text-and-logo.pdf", text))
+    assert doc.page_count == 1
+    assert doc.embedded_image_count == 1
+    assert text in doc.text
+    assert any(text in chunk.text for chunk in doc.chunks)
+    assert doc.unreadable_pages == []
+    assert "Page 1: embedded images are not interpreted; review required." in doc.warnings
+    assert not any("insufficient readable text" in warning for warning in doc.warnings)
+
+
+@pytest.mark.parametrize("text", ["", "Short caption."], ids=["image-only", "sparse-text"])
+def test_image_with_insufficient_text_remains_unreadable(tmp_path, text):
+    doc = parse_pdf(write_image_pdf(tmp_path / "unreadable-image.pdf", text))
+    assert doc.page_count == 1
+    assert doc.embedded_image_count == 1
     assert doc.unreadable_pages == [1]
-    assert any("reading order" in warning for warning in doc.warnings)
+    assert "Page 1: insufficient readable text; local OCR/manual review required." in doc.warnings
+
+
+def test_blank_page_remains_unreadable(tmp_path):
+    from eval.variants import _write_text_pdf
+    path = tmp_path / "blank.pdf"
+    _write_text_pdf([], path)
+    doc = parse_pdf(path)
+    assert doc.page_count == 1
+    assert doc.embedded_image_count == 0
+    assert not doc.chunks
+    assert doc.unreadable_pages == [1]
+    assert "Page 1: insufficient readable text; local OCR/manual review required." in doc.warnings
 
 
 def test_streamlit_renders_persisted_graph_result(tmp_path, monkeypatch):
