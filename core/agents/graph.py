@@ -144,8 +144,6 @@ def analyze_question(question: Question, index, client, *, run_id: str, assessme
             "unresolved": result.get("unresolved", []), "error": result.get("error"),
             "duration_ms": (time.monotonic() - t0) * 1000,
         })
-        if result.get("error"):
-            raise ValueError(f"{name}: {result['error']}")
         return result
 
     def router(state: GraphState):
@@ -178,10 +176,15 @@ def analyze_question(question: Question, index, client, *, run_id: str, assessme
 
     def retrieve(state: GraphState):
         nonlocal scanned_modifiers
+        modifier_error = ""
         if scanned_modifiers is None:
             response = tool("find_modifiers", {}, "*")
-            scanned_modifiers = [index._by_id[r["chunk_id"]] for r in response["results"]]
+            if response.get("error"):
+                modifier_error = f"find_modifiers: {response['error']}"
+            else:
+                scanned_modifiers = [index._by_id[r["chunk_id"]] for r in response["results"]]
         packs = dict(state["packs"])
+        feedback = dict(state["feedback"])
         no_progress = True
         new_actions = 0
         for sub_id in state["pending"]:
@@ -190,8 +193,14 @@ def analyze_question(question: Question, index, client, *, run_id: str, assessme
             original = set(selected)
             strategies = dict(old.strategy_chunks or {}) if old else {}
             unresolved = set(old.unresolved_references if old else ())
+            tool_errors = [modifier_error] if modifier_error else []
 
             def add(name, result):
+                if result.get("error"):
+                    error = f"{name}: {result['error']}"
+                    if error not in tool_errors:
+                        tool_errors.append(error)
+                    return []
                 chunks = [index._by_id[r["chunk_id"]] for r in result.get("results", [])]
                 selected.update((c.chunk_id, c) for c in chunks)
                 strategies.setdefault(name, []).extend(chunks)
@@ -215,17 +224,21 @@ def analyze_question(question: Question, index, client, *, run_id: str, assessme
                         add("read_context", tool("read_context", {"chunk_id": hit.chunk_id}, sub_id))
                         add("resolve_reference", tool("resolve_reference", {"chunk_id": hit.chunk_id,
                                                                           "query": subs[sub_id].text}, sub_id))
-            selected.update((c.chunk_id, c) for c in scanned_modifiers)
-            strategies["find_modifiers"] = scanned_modifiers
+            selected.update((c.chunk_id, c) for c in scanned_modifiers or [])
+            strategies["find_modifiers"] = scanned_modifiers or []
             kept, size = [], 0
             for chunk in selected.values():
                 if size + len(chunk.text) <= limits.context_chars:
                     kept.append(chunk)
                     size += len(chunk.text)
             packs[sub_id] = EvidencePack(sub_id, kept, list(strategies), strategies,
-                                         sorted(unresolved), len(kept) != len(selected))
+                                         sorted(unresolved), len(kept) != len(selected), tool_errors)
+            if tool_errors:
+                feedback[sub_id] = (f"Retry evidence retrieval for {subs[sub_id].text} Tool errors: "
+                                    + "; ".join(tool_errors))
             no_progress = no_progress and original == {c.chunk_id for c in kept}
-        return {"packs": packs, "stop_reason": "repeated_actions" if state["round"] and not new_actions else ""}
+        return {"packs": packs, "feedback": feedback,
+                "stop_reason": "repeated_actions" if state["round"] and not new_actions else ""}
 
     def judging(state: GraphState):
         findings = dict(state["findings"])
@@ -276,6 +289,7 @@ def analyze_question(question: Question, index, client, *, run_id: str, assessme
             "or unresolved limitation, not hidden reasoning. confidence is judgment reliability in [0,1]. "
             "Do not accept unsupported facets or invalid quotations. A NOT_FOUND conclusion needs an "
             "adequate search, not just one empty result. Review search_history and source_coverage. "
+            "Failed tools are not evidence of absence; use tool_errors for targeted follow-up. "
             "When all source chunks were read and alternate searches found no obligation, absence "
             "can be accepted as NOT_FOUND; do not demand a clause explicitly declaring its own absence. "
             "Accept only if missing references are immaterial."
@@ -292,6 +306,7 @@ def analyze_question(question: Question, index, client, *, run_id: str, assessme
                 ],
                 "verification": {s: [asdict(c) for c in state["checks"][s]] for s in state["pending"]},
                 "unresolved_references": {s: state["packs"][s].unresolved_references for s in state["pending"]},
+                "tool_errors": {s: state["packs"][s].tool_errors for s in state["pending"]},
                 "round": state["round"],
                 "search_history": {
                     s: [{"query": t["arguments"].get("query"), "source_ids": t["source_ids"]}
@@ -314,7 +329,7 @@ def analyze_question(question: Question, index, client, *, run_id: str, assessme
             batch = {**request, "pending_check_ids": ids,
                      "checks": [s for s in request["checks"] if s["id"] in ids],
                      "findings": [f for f in request["findings"] if f["sub_requirement_id"] in ids]}
-            for field in ("verification", "unresolved_references", "search_history", "source_coverage"):
+            for field in ("verification", "unresolved_references", "tool_errors", "search_history", "source_coverage"):
                 batch[field] = {s: request[field][s] for s in ids}
             needed = {c.chunk_id for s in ids for c in state["packs"][s].chunks}
             batch["evidence"] = [c for c in request["evidence"] if c["chunk_id"] in needed]
@@ -347,6 +362,9 @@ def analyze_question(question: Question, index, client, *, run_id: str, assessme
                 gap = "Repair invalid evidence: " + "; ".join(c.detail for c in state["checks"][sub_id] if not c.passed)
             if finding.verdict == "NOT_FOUND" and state["round"] == 0:
                 decision, gap = "retrieve", "Search alternate wording and full context for: " + subs[sub_id].text
+            if pack.tool_errors:
+                decision = "retrieve"
+                gap = " ".join(part for part in (gap, feedback[sub_id]) if part)
             if pack.truncated or index.doc.unreadable_pages:
                 pending.append(sub_id)
                 feedback[sub_id] = "Evidence context truncated or unreadable document pages."

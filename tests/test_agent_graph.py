@@ -166,6 +166,167 @@ def test_critic_feedback_causes_targeted_second_retrieval(tmp_path):
     assert "dispatch timing" in events[1]["actions"][0]["arguments"]["query"]
 
 
+@pytest.mark.parametrize("failure_mode", ["once", "always"])
+def test_search_tool_error_is_scoped_and_retried(tmp_path, monkeypatch, failure_mode):
+    import core.agents.graph as graph
+    from core.tools.evidence import build_evidence_registry
+
+    path, index = make_index(tmp_path)
+    question = rubric()["Q1"]
+    failed_check = question.sub_requirements[0]
+    registry = build_evidence_registry(index)
+    search = registry.get("search_evidence")
+    error = "Search target unavailable; choose another query."
+    failures = []
+    packs = []
+    real_judge = graph.judge
+
+    def search_with_error(query, k=6):
+        if query.startswith(failed_check.text) and (failure_mode == "always" or not failures):
+            failures.append(query)
+            return {"error": error}
+        return search.handler(query=query, k=k)
+
+    def record_pack(sub_req, pack, client, retry_reason=""):
+        packs.append(pack)
+        return real_judge(sub_req, pack, client, retry_reason)
+
+    registry.register(replace(search, handler=search_with_error))
+    monkeypatch.setattr(graph, "build_evidence_registry", lambda _: registry)
+    monkeypatch.setattr(graph, "judge", record_pack)
+
+    class FeedbackClient(StubLLM):
+        def __post_init__(self):
+            super().__post_init__()
+            self.routes = []
+            self.critiques = []
+
+        def complete_json(self, system, user, schema, example=None):
+            payload, response = super().complete_json(system, user, schema, example)
+            if "ROLE: evidence_router" in system:
+                self.routes.append(json.loads(user))
+                if len(self.routes) > 1:
+                    payload["actions"][0]["arguments"]["query"] = (
+                        f"{failed_check.text} Alternate wording {len(self.routes)}"
+                    )
+            if "ROLE: evidence_critic" in system:
+                self.critiques.append(json.loads(user))
+            return payload, response
+
+    client = FeedbackClient()
+    result = analyze(path, client, rubric={question.id: question}, index=index)
+    unaffected = [f for f in result.questions[0].findings if f.sub_requirement_id != failed_check.id]
+    assert all(f.verdict == "MET" and f.quote_verified and f.search_complete for f in unaffected)
+    assert all(sum(p.sub_requirement_id == f.sub_requirement_id for p in packs) == 1 for f in unaffected)
+    failed_packs = [p for p in packs if p.sub_requirement_id == failed_check.id]
+    assert failed_packs and not failed_packs[0].chunks
+    assert failed_packs[0].tool_errors == [f"search_evidence: {error}"]
+    assert all(not p.tool_errors for p in packs if p.sub_requirement_id != failed_check.id)
+    assert len(client.routes) >= 2
+    for route in client.routes[1:]:
+        assert [s["id"] for s in route["checks"]] == [failed_check.id]
+        assert error in route["feedback"][failed_check.id]
+    assert client.critiques[0]["tool_errors"][failed_check.id] == failed_packs[0].tool_errors
+    events = result.audit_events
+    assert all(e["error"] is None and e["stop_reason"] != "invalid_agent_output" for e in events)
+    errors = [t for e in events for t in e["tool_calls"] if t["error"]]
+    assert len(errors) == len(failures)
+    assert all(t["check_id"] == failed_check.id and t["error"] == error for t in errors)
+    output = to_output_document(result, index)
+    validate(output, analysis_result_schema())
+    assert len(output["questions"]) == 1 and not output["review_required"]
+    if failure_mode == "once":
+        assert not result.incomplete
+        assert output["questions"][0]["Compliance State"] == "Fully Compliant"
+        assert failed_packs[-1].tool_errors == []
+        assert result.usage["resolved_followup_checks"] == 1
+    else:
+        assert result.incomplete
+        assert output["questions"][0]["Compliance State"] == "Partially Compliant"
+        assert error in output["questions"][0]["Rationale"]
+        assert events[-1]["stop_reason"] == "followup_budget"
+
+
+@pytest.mark.parametrize("tool_name", ["read_context", "resolve_reference"])
+def test_context_tool_error_preserves_retrieved_evidence(tmp_path, monkeypatch, tool_name):
+    import core.agents.graph as graph
+    from core.tools.evidence import build_evidence_registry
+
+    path, index = make_index(tmp_path)
+    registry = build_evidence_registry(index)
+    tool = registry.get(tool_name)
+    error = f"{tool_name} unavailable"
+    failed = False
+
+    def fail_once(**arguments):
+        nonlocal failed
+        if not failed:
+            failed = True
+            return {"error": error, "results": [{"chunk_id": "invalid-error-source"}]}
+        return tool.handler(**arguments)
+
+    registry.register(replace(tool, handler=fail_once))
+    monkeypatch.setattr(graph, "build_evidence_registry", lambda _: registry)
+    result = analyze(path, StubLLM(), rubric={"Q1": rubric()["Q1"]}, index=index)
+    assert not result.incomplete
+    assert result.questions[0].state == "Fully Compliant"
+    assert result.usage["followup_checks"] == 1
+    retrieve = next(e for e in result.audit_events if e["node"] == "retrieve")
+    assert retrieve["error"] is None
+    assert any(t["error"] == error for t in retrieve["tool_calls"])
+    assert "invalid-error-source" not in result.evidence_snapshot
+    assert all(f.verdict == "MET" for f in result.questions[0].findings)
+    assert all(f.quote_verified for f in result.questions[0].findings)
+    judge = next(e for e in result.audit_events if e["node"] == "judge")
+    assert set(judge["finding_states"].values()) == {"MET"}
+    critic = next(e for e in result.audit_events if e["node"] == "critic")
+    assert error in critic["feedback"]["weekly_dispatch"]
+
+
+def test_modifier_scan_error_is_reported_and_retried(tmp_path, monkeypatch):
+    import core.agents.graph as graph
+    from core.tools.evidence import build_evidence_registry
+
+    path, index = make_index(tmp_path)
+    registry = build_evidence_registry(index)
+    tool = registry.get("find_modifiers")
+    scans = []
+    error = "Modifier scan unavailable."
+
+    def fail_once():
+        scans.append(True)
+        return {"error": error} if len(scans) == 1 else tool.handler()
+
+    class CoverageClient(StubLLM):
+        def __post_init__(self):
+            super().__post_init__()
+            self.critiques = []
+
+        def complete_json(self, system, user, schema, example=None):
+            payload, response = super().complete_json(system, user, schema, example)
+            if "ROLE: evidence_critic" in system:
+                self.critiques.append(json.loads(user))
+            return payload, response
+
+    registry.register(replace(tool, handler=fail_once))
+    monkeypatch.setattr(graph, "build_evidence_registry", lambda _: registry)
+    client = CoverageClient()
+    result = analyze(path, client, rubric={"Q1": rubric()["Q1"]}, index=index)
+    assert not result.incomplete
+    assert result.questions[0].state == "Fully Compliant"
+    assert len(scans) == 2
+    assert len(client.critiques) == 2
+    assert all(not coverage["modifier_scan_complete"]
+               for coverage in client.critiques[0]["source_coverage"].values())
+    assert all(errors == [f"find_modifiers: {error}"]
+               for errors in client.critiques[0]["tool_errors"].values())
+    assert all(coverage["modifier_scan_complete"]
+               for coverage in client.critiques[1]["source_coverage"].values())
+    assert all(not errors for errors in client.critiques[1]["tool_errors"].values())
+    errors = [t for e in result.audit_events for t in e["tool_calls"] if t["error"]]
+    assert len(errors) == 1 and errors[0]["error"] == error and errors[0]["check_id"] == "*"
+
+
 def test_one_unresolved_check_keeps_all_five_questions_in_output(tmp_path):
     class UnresolvedCheckClient(StubLLM):
         def complete_json(self, system, user, schema, example=None):

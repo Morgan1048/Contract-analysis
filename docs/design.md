@@ -63,6 +63,13 @@ validated JSON and typed Python records, not free-form inter-agent messages.
   context/table reads, actual-reference resolution and modifier discovery.
 - The first pass requires semantic retrieval. Source lookups are only based on
   identifiers discovered in the current document.
+- Structured evidence-tool errors contribute no chunks and do not abort other
+  checks. Current-pass errors stay in each affected evidence pack and judge/critic
+  feedback; the router can select an alternative within the existing follow-up
+  budget. A successful follow-up clears current-pass errors, not their audit
+  history. Failed modifier scans are reported as incomplete and retried, not
+  cached as empty successes. Registry numeric bounds reject invalid arguments
+  before handlers run.
 - A document-wide modifier candidate scan complements positive-query retrieval.
   Candidates are not automatic downgrades; the judge/critic must establish
   normative authority, relevance, scope, dates and the specific affected obligation.
