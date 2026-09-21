@@ -11,8 +11,8 @@ Thresholds are provisional operational guardrails, not measured quality guarante
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 import json
-from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -62,7 +62,12 @@ def _percentile(values: list[float], pct: float) -> float:
     return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
 
 
-def snapshot(store) -> dict:
+def _time(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value)
+    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+
+
+def snapshot(store, *, now: datetime | None = None) -> dict:
     """Current operational KPI state, aggregated across every stored run.
 
     Missing quotation attempts and price observations remain unavailable.
@@ -121,12 +126,14 @@ def snapshot(store) -> dict:
         "latest_chunk_count": latest["chunk_count"] if latest else 0,
         "latest_table_row_chunks": latest["table_row_chunks"] if latest else 0,
         **agent,
+        **quality_snapshot(store, now=now),
     }
 
 
 def agent_metrics(store) -> dict:
-    payloads = [json.loads(row["payload"]) for row in store.db.execute(
-        "SELECT s.payload FROM run_snapshots s JOIN runs r ON r.run_id=s.run_id "
+    payloads = [{**json.loads(row["payload"]), "started_at": row["started_at"], "run_id": row["run_id"]}
+                for row in store.db.execute(
+        "SELECT s.payload, r.started_at, r.run_id FROM run_snapshots s JOIN runs r ON r.run_id=s.run_id "
         "WHERE r.demo=0 ORDER BY r.started_at"
     )]
     return summarize_agent_payloads(payloads)
@@ -140,6 +147,7 @@ def summarize_agent_payloads(payloads: list[dict]) -> dict:
     n = len(usage)
     checks = [f for p in payloads for q in p["questions"] for f in q["findings"]]
     followups = total("followup_checks")
+    latest = max(payloads, key=lambda p: (_time(p["started_at"]), p["run_id"])) if payloads else None
     return {
         "instrumented_runs": n,
         "completion_rate": sum(not p["incomplete"] for p in payloads) / n if n else None,
@@ -151,7 +159,7 @@ def summarize_agent_payloads(payloads: list[dict]) -> dict:
         "mean_llm_calls": total("llm_calls") / n if n else None,
         "mean_tool_calls": total("tool_calls") / n if n else None,
         "mean_tokens": total("total_tokens") / n if n else None,
-        "latest_parse_warning_count": len(usage[-1].get("parse_warnings", [])) if usage else 0,
+        "latest_parse_warning_count": len(latest["usage"].get("parse_warnings", [])) if latest else 0,
     }
 
 
@@ -197,7 +205,8 @@ def calibration(store, bins: int = 5) -> list[dict]:
     rows = db.execute(
         "SELECT q.confidence AS confidence, e.correct AS correct "
         "FROM eval_results e JOIN question_results q "
-        "ON q.run_id = e.run_id AND q.question_id = e.question_id"
+        "ON q.run_id = e.run_id AND q.question_id = e.question_id "
+        "JOIN runs r ON r.run_id=e.run_id WHERE e.demo=0 AND q.demo=0 AND r.demo=0"
     ).fetchall()
 
     width = 1.0 / bins
@@ -230,17 +239,85 @@ def gold_set_accuracy(store, run_id: str | None = None) -> float | None:
     the gold set, so callers can tell "no data" from "0% accurate".
     """
     row = store.db.execute(
-        "SELECT COUNT(*) AS n, COALESCE(SUM(correct), 0) AS correct FROM eval_results "
-        "WHERE (? IS NULL OR run_id=?)", (run_id, run_id),
+        "SELECT COUNT(*) AS n, COALESCE(SUM(e.correct), 0) AS correct "
+        "FROM eval_results e JOIN runs r ON r.run_id=e.run_id "
+        "WHERE e.demo=0 AND r.demo=0 AND (? IS NULL OR e.run_id=?)", (run_id, run_id),
     ).fetchone()
     if not row["n"]:
         return None
     return row["correct"] / row["n"]
 
 
-def latest_analysis_diagnostics(store) -> dict | None:
+def quality_snapshot(store, *, now: datetime | None = None) -> dict:
+    """Shared quality-alert inputs; no inference or fabricated missing scores."""
+    now = _time((now or datetime.now(timezone.utc)).isoformat())
+    latest = store.db.execute(
+        "SELECT r.run_id, json_extract(s.payload, '$.rubric_hash') AS rubric_hash, "
+        "json_extract(s.payload, '$.usage.pipeline_version') AS pipeline_version "
+        "FROM runs r LEFT JOIN run_snapshots s ON s.run_id=r.run_id "
+        "WHERE r.demo=0 AND julianday(r.started_at)<=julianday(?) "
+        "ORDER BY julianday(r.started_at) DESC, r.run_id DESC LIMIT 1",
+        (now.isoformat(),),
+    ).fetchone()
+    current_start, baseline_start = now - timedelta(days=7), now - timedelta(days=14)
+    baseline = {
+        "current_start": current_start.isoformat(), "baseline_start": baseline_start.isoformat(),
+        "end": now.isoformat(), "current_runs": 0, "baseline_runs": 0,
+        "minimum_runs_per_question": 5,
+        "reason": "The latest non-demo run needs recorded rubric and pipeline versions.",
+    }
+    result = {
+        "quality_run_id": latest["run_id"] if latest else None,
+        "accuracy_vs_gold_set": gold_set_accuracy(store, latest["run_id"]) if latest else None,
+        "calibration_bins": calibration(store),
+        "state_distribution_drift": None,
+        "state_distribution_baseline": baseline,
+    }
+    if not latest or not latest["rubric_hash"] or not latest["pipeline_version"]:
+        return result
+    rows = store.db.execute(
+        "SELECT r.run_id, r.started_at, q.question_id, q.state "
+        "FROM runs r JOIN question_results q ON q.run_id=r.run_id "
+        "JOIN run_snapshots s ON s.run_id=r.run_id "
+        "WHERE r.demo=0 AND q.demo=0 AND r.status='completed' "
+        "AND q.state IN ('Fully Compliant','Partially Compliant','Non-Compliant') "
+        "AND json_extract(s.payload, '$.rubric_hash')=? "
+        "AND json_extract(s.payload, '$.usage.pipeline_version')=? "
+        "AND json_extract(s.payload, '$.incomplete')=0 "
+        "AND julianday(r.started_at)>=julianday(?) AND julianday(r.started_at)<=julianday(?)",
+        (latest["rubric_hash"], latest["pipeline_version"], baseline_start.isoformat(), now.isoformat()),
+    ).fetchall()
+    counts: dict[str, dict[str, dict[str, int]]] = {"current": {}, "baseline": {}}
+    runs: dict[str, set[str]] = {"current": set(), "baseline": set()}
+    for row in rows:
+        window = "current" if _time(row["started_at"]) >= current_start else "baseline"
+        runs[window].add(row["run_id"])
+        states = counts[window].setdefault(row["question_id"], {})
+        states[row["state"]] = states.get(row["state"], 0) + 1
+    baseline.update(current_runs=len(runs["current"]), baseline_runs=len(runs["baseline"]),
+                    rubric_hash=latest["rubric_hash"], pipeline_version=latest["pipeline_version"])
+    if (not counts["current"] or counts["current"].keys() != counts["baseline"].keys()
+        or any(sum(states.values()) < baseline["minimum_runs_per_question"]
+               for window in counts.values() for states in window.values())):
+        baseline["reason"] = (
+            "Need the same questions and at least 5 completed, non-demo runs per question in each "
+            "7-day window, using the latest run's rubric and pipeline versions."
+        )
+        return result
+    shifts = []
+    for question, current in counts["current"].items():
+        previous = counts["baseline"][question]
+        shifts.extend(abs(current.get(state, 0) / sum(current.values())
+                          - previous.get(state, 0) / sum(previous.values()))
+                      for state in current.keys() | previous.keys())
+    result["state_distribution_drift"] = max(shifts)
+    baseline["reason"] = "Comparable observations available; shifts may reflect contract mix, not model regression."
+    return result
+
+
+def latest_analysis_diagnostics(store, run_id: str | None = None) -> dict | None:
     from core.obs.otel import _redact
-    run_id = store.latest_run_id()
+    run_id = run_id or store.latest_run_id()
     result = store.get_run(run_id) if run_id else None
     if result is None:
         return None
@@ -256,25 +333,6 @@ def latest_analysis_diagnostics(store) -> dict | None:
             for e in result.audit_events if e.get("stop_reason") not in {"", "complete", None}
         ],
     }
-
-
-def rag_context_quality(store) -> dict[str, float] | None:
-    """Exact context precision/recall for the most recently stored run,
-    computed lazily via ``core.rag_metrics`` against ``eval/gold_contexts.yaml``.
-
-    This re-parses and re-routes the run's own source document rather than
-    reading anything persisted, because no run currently records the
-    retrieval packs it used. It is deliberately lazy: nothing here runs at
-    import time, and an empty store (no runs, or a source document that can
-    no longer be read) returns ``None`` instead of raising, so the KPI tab
-    still renders.
-    """
-    run_id = store.latest_run_id()
-    if run_id is None:
-        return None
-    metrics = store.quality_metrics_for_run(run_id)
-    values = {key: metrics.get(key, {}).get("computed") for key in ("context_precision", "context_recall")}
-    return values if all(value is not None for value in values.values()) else None
 
 
 # KPI definitions, formulas, thresholds, severities, and actions are kept
@@ -343,8 +401,8 @@ KPI_SPECS: dict[str, KpiSpec] = {
     ),
     "accuracy_vs_gold_set": KpiSpec(
         "accuracy_vs_gold_set",
-        "The exact compliance-state match rate against the hand-built gold set; it is the only direct quality measure available.",
-        "correct exact-state eval results / total eval results",
+        "The latest non-demo run's exact compliance-state match rate against recorded hand-built gold labels; unavailable when that run has no labels.",
+        "correct exact-state eval results / total eval results for the latest non-demo run",
         (KpiTrigger(
             0.80,
             "warn",
@@ -363,8 +421,8 @@ KPI_SPECS: dict[str, KpiSpec] = {
     ),
     "state_distribution_drift": KpiSpec(
         "state_distribution_drift",
-        "The week-over-week shift in compliance-state distribution; it detects silent regression when no gold label exists for new documents.",
-        "maximum percentage-point shift in state distribution week over week",
+        "A diagnostic week-over-week shift in compliance states, not measured accuracy or proof of model regression. Compare completed non-demo runs with matching rubric and pipeline versions; at least five observations per question per window.",
+        "max over questions and states of abs(current 7-day state share - preceding 7-day state share)",
         (KpiTrigger(0.25, "warn", "Compare against corpus mix before assuming a model problem."),),
     ),
 }
@@ -396,17 +454,19 @@ def _alert(spec: KpiSpec, value: float, threshold: float | None = None, trigger:
     return Alert(spec.name, value, active.threshold if threshold is None else threshold, active.severity, active.action)
 
 
-def kpi_current_value(name: str, snapshot: dict, *, calibration_bins: list[dict] | None = None, accuracy: float | None = None, state_distribution_shift: float | None = None) -> float:
+def kpi_current_value(name: str, snapshot: dict, *, calibration_bins: list[dict] | None = None, accuracy: float | None = None, state_distribution_shift: float | None = None) -> float | None:
     if name == "parse_anomaly":
         return snapshot.get("latest_parse_warning_count", 0)
     if name == "accuracy_vs_gold_set":
-        return 0.0 if accuracy is None else accuracy
+        return snapshot.get(name) if accuracy is None else accuracy
     if name == "confidence_calibration":
+        if calibration_bins is None:
+            calibration_bins = snapshot.get("calibration_bins")
         if not calibration_bins:
-            return 0.0
+            return None
         return max(abs(b["predicted_confidence"] - b["observed_accuracy"]) for b in calibration_bins)
     if name == "state_distribution_drift":
-        return 0.0 if state_distribution_shift is None else state_distribution_shift
+        return snapshot.get(name) if state_distribution_shift is None else state_distribution_shift
     return snapshot.get(name, 0.0)
 
 
@@ -419,22 +479,24 @@ def kpi_threshold(name: str, snapshot: dict | None = None) -> float:
 
 def kpi_explanation(name: str, snapshot: dict, *, calibration_bins: list[dict] | None = None, accuracy: float | None = None, state_distribution_shift: float | None = None) -> dict:
     spec = kpi_spec(name)
-    return {
+    value = kpi_current_value(name, snapshot, calibration_bins=calibration_bins, accuracy=accuracy,
+                              state_distribution_shift=state_distribution_shift)
+    result = {
         "found": True,
         "name": spec.name,
         "definition": spec.definition,
         "formula": spec.formula,
         "threshold": kpi_threshold(name, snapshot),
         "severity": spec.severity,
-        "current_value": kpi_current_value(
-            name,
-            snapshot,
-            calibration_bins=calibration_bins,
-            accuracy=accuracy,
-            state_distribution_shift=state_distribution_shift,
-        ),
+        "current_value": value,
+        "available": value is not None,
         "action": spec.action,
     }
+    if name == "accuracy_vs_gold_set":
+        result["run_id"] = snapshot.get("quality_run_id")
+    if name == "state_distribution_drift":
+        result["baseline"] = snapshot.get("state_distribution_baseline")
+    return result
 
 
 def evaluate_thresholds(
@@ -481,16 +543,16 @@ def evaluate_thresholds(
         if warnings >= kpi_spec("parse_anomaly").threshold:
             alerts.append(_alert(kpi_spec("parse_anomaly"), warnings))
 
+    accuracy = kpi_current_value("accuracy_vs_gold_set", snapshot, accuracy=accuracy)
     if accuracy is not None and accuracy < kpi_spec("accuracy_vs_gold_set").threshold:
         alerts.append(_alert(kpi_spec("accuracy_vs_gold_set"), accuracy))
 
-    if calibration_bins:
-        max_deviation = max(
-            abs(b["predicted_confidence"] - b["observed_accuracy"]) for b in calibration_bins
-        )
-        if max_deviation > kpi_spec("confidence_calibration").threshold:
-            alerts.append(_alert(kpi_spec("confidence_calibration"), max_deviation))
+    max_deviation = kpi_current_value("confidence_calibration", snapshot, calibration_bins=calibration_bins)
+    if max_deviation is not None and max_deviation > kpi_spec("confidence_calibration").threshold:
+        alerts.append(_alert(kpi_spec("confidence_calibration"), max_deviation))
 
+    state_distribution_shift = kpi_current_value("state_distribution_drift", snapshot,
+                                                  state_distribution_shift=state_distribution_shift)
     if state_distribution_shift is not None and state_distribution_shift > kpi_spec("state_distribution_drift").threshold:
         alerts.append(_alert(kpi_spec("state_distribution_drift"), state_distribution_shift))
 

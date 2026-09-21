@@ -1,0 +1,86 @@
+documents:
+  sample:
+    source: Sample Contract.pdf
+    questions:
+      Q1:
+        expected_state: Partially Compliant
+        sub_requirements:
+          P1: MET
+          P2: MET
+          P3: MET
+          P4: MET
+          P5: MET
+          P6: PARTIAL
+          P7: PARTIAL
+      Q2:
+        expected_state: Fully Compliant
+        sub_requirements:
+          A1: MET
+          A2: MET
+          A3: MET
+          A4: MET
+      Q3:
+        expected_state: Fully Compliant
+        sub_requirements:
+          T1: MET
+          T2: MET
+          T3: MET
+          T4: MET
+      Q4:
+        expected_state: Fully Compliant
+        sub_requirements:
+          E1: MET
+          E2: MET
+          E3: MET
+          E4: MET
+          E5: MET
+      Q5:
+        expected_state: Partially Compliant
+        sub_requirements:
+          N1: MET
+          N2: PARTIAL
+          N3: MET
+          N4: MET
+          N5: MET
+  no_tls_version:
+    source: eval/fixtures/no_tls_version.pdf
+    questions:
+      Q4:
+        expected_state: Partially Compliant
+        sub_requirements:
+          E1: NOT_FOUND
+          E2: MET
+          E3: MET
+          E4: MET
+          E5: MET
+  no_training_row:
+    source: eval/fixtures/no_training_row.pdf
+    questions:
+      Q3:
+        expected_state: Non-Compliant
+        sub_requirements:
+          T1: NOT_FOUND
+          T2: NOT_FOUND
+          T3: NOT_FOUND
+          T4: NOT_FOUND
+  deviation_closed:
+    source: eval/fixtures/deviation_closed.pdf
+    questions:
+      Q1:
+        expected_state: Fully Compliant
+        sub_requirements:
+          P1: MET
+          P2: MET
+          P3: MET
+          P4: MET
+          P5: MET
+          P6: MET
+          P7: MET
+      Q5:
+        expected_state: Fully Compliant
+        sub_requirements:
+          N1: MET
+          N2: MET
+          N3: MET
+          N4: MET
+          N5: MET

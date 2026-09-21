@@ -4,116 +4,23 @@ from __future__ import annotations
 
 from typing import Any
 
-from core.kpi import calibration, evaluate_thresholds, gold_set_accuracy, history, snapshot
-from eval.ragas_eval import COMPUTE_HINT
-
-# Each note is specific to its own metric: what it measures, and the concrete
-# reason a judged value and a computed value can disagree for *that* metric.
-# (A single shared sentence across rows previously hid this.)
-_NOTES: dict[str, str] = {
-    "faithfulness": (
-        "Faithfulness / groundedness of claims is assessed by an optional LLM judge. There is no exact "
-        "programmatic equivalent: quotation matching proves provenance, not entailment. "
-        "These scores are judge estimates, not gold-set accuracy."
-    ),
-    "noise_sensitivity": (
-        "Noise sensitivity is how much the answer changes when irrelevant retrieved context is "
-        "added. It has no set-arithmetic equivalent -- there is no gold label for 'this chunk "
-        "is noise' -- so it is judged-only and the exact column is not applicable."
-    ),
-    "answer_correctness": (
-        "Answer correctness is the exact compliance-state match rate against the hand-built "
-        "gold set in eval_results. The exact value is a strict equality count; a RAGAS judge "
-        "would instead score semantic similarity to a reference answer, which can rate a "
-        "differently-worded but equivalent state as correct where the exact match would not."
-    ),
-}
+from core.kpi import evaluate_thresholds, history, snapshot
 
 
-def _format_metric(value: Any) -> Any:
-    """Render a numeric cell in a short, consistent form (percentage for a
-    0..1 ratio, otherwise a few significant figures) instead of a raw float
-    repr such as ``0.9515151515151515``.
+def _format_metric(value: Any, *, as_percentage: bool | None = None) -> Any:
+    """Render a numeric cell in a short, consistent form instead of a raw
+    float repr such as ``0.9515151515151515``.
+
+    ``as_percentage`` picks the format explicitly (a rate/ratio vs. a count);
+    when omitted it falls back to inferring from magnitude, which is only
+    safe for metrics that are always ratios (never a count that can land in
+    ``[0, 1]``, e.g. a mean of 1.0 calls/document).
     """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return value
-    if 0.0 <= value <= 1.0:
+    if as_percentage if as_percentage is not None else (0.0 <= value <= 1.0):
         return f"{value:.1%}"
     return f"{value:.3g}"
-
-
-def _ragas_cell(judged: Any, status: Any) -> Any:
-    """What the RAGAS column should say, given the three availability states.
-
-    Each state needs a *different* action from the reader, so each gets its own
-    text: install the extra, fix a version conflict, configure a judge, or run
-    the (deliberately manual, because it costs model calls) scoring pass.
-    """
-    if judged is not None:
-        return _format_metric(judged)
-    if status.ready:
-        return f"not yet computed for this run -- run {COMPUTE_HINT}"
-    return f"unavailable ({status.reason} -- {status.action})" if status.action else f"unavailable ({status.reason})"
-
-
-def _ragas_unavailable_reason() -> str:
-    """Why the RAGAS column has no number: not installed, installed but failing
-    to import (with the real exception), or importable with no judge configured.
-    """
-    import eval.ragas_eval as ragas_eval
-
-    status = ragas_eval.ragas_status()
-    if status.ready:
-        return f"not yet computed for this run -- run {COMPUTE_HINT}"
-    return status.message
-
-
-def quality_comparisons(store: Any, snap: dict[str, Any]) -> list[dict[str, Any]]:
-    """Rows for adjacent judged/computed metrics; unavailable data stays explicit."""
-    import eval.ragas_eval as ragas_eval
-
-    run_id = store.latest_run_id() if hasattr(store, "latest_run_id") else None
-    # Run-scoped: a cached RAGAS pass belongs to the run it scored, and
-    # averaging it across history would misattribute the number.
-    if run_id is not None and hasattr(store, "quality_metrics_for_run"):
-        persisted = store.quality_metrics_for_run(run_id)
-    else:
-        persisted = store.quality_metrics() if hasattr(store, "quality_metrics") else {}
-    accuracy = gold_set_accuracy(store, run_id=run_id)
-    status = ragas_eval.ragas_status()
-    from core.kpi import latest_analysis_diagnostics
-    diagnostic = latest_analysis_diagnostics(store) if hasattr(store, "get_run") else None
-
-    rows = [
-        ("Faithfulness / groundedness", "faithfulness", False, None),
-        ("Noise sensitivity", "noise_sensitivity", False, None),
-        ("Answer correctness", "answer_correctness", True, accuracy),
-    ]
-    output = []
-    for label, key, has_pair, fallback in rows:
-        values = persisted.get(key, {})
-        computed = values.get("computed", fallback)
-        judged = _ragas_cell(values.get("ragas"), status)
-        note = _NOTES[key]
-        if diagnostic and diagnostic["instrumented"]:
-            if values.get("ragas") is None:
-                if diagnostic["completed_checks"] == 0:
-                    judged = "blocked: this run has no completed findings to score"
-                elif key != "faithfulness":
-                    judged = "requires reviewed reference labels for this document/rubric version"
-                elif status.ready:
-                    judged = f"not computed; run {COMPUTE_HINT} --run-id {run_id} --metrics faithfulness"
-            if has_pair and computed is None:
-                note = "No matching recorded gold evaluation for this run. " + note
-        output.append({
-            "Metric": label,
-            "RAGAS (LLM-judged)": judged,
-            "Exact (computed)": _format_metric(computed) if has_pair and computed is not None else (
-                "not applicable" if not has_pair else "unavailable"
-            ),
-            "Note": note,
-        })
-    return output
 
 
 def render(store: Any, st: Any) -> None:
@@ -125,12 +32,12 @@ def render(store: Any, st: Any) -> None:
         )
 
     snap = snapshot(store)
-    bins = calibration(store)
-    alerts = evaluate_thresholds(snap, calibration_bins=bins or None)
+    bins = snap["calibration_bins"]
+    alerts = evaluate_thresholds(snap)
 
     st.header("Operational (real time)")
     st.caption(f"All-history operations: {snap['runs']} runs. Agent reliability below uses only "
-               f"{snap['instrumented_runs']} instrumented, non-demo runs; quality scores refer to the latest run.")
+               f"{snap['instrumented_runs']} instrumented, non-demo runs; quality scores refer to the latest non-demo run.")
     cols = st.columns(4)
     cols[0].metric("Runs", snap["runs"])
     cols[1].metric("Quote verification failure rate",
@@ -159,13 +66,16 @@ def render(store: Any, st: Any) -> None:
         if diagnostic["stops"]:
             st.table(diagnostic["stops"])
     st.table([
-        {"Metric": label, "Value": _format_metric(snap[key]) if snap[key] is not None else "unavailable"}
-        for label, key in [
-            ("Completion rate", "completion_rate"), ("Checks needing review", "review_rate"),
-            ("Follow-up resolution rate", "followup_resolution_rate"),
-            ("Budget exhaustion rate", "budget_exhaustion_rate"),
-            ("Mean LLM calls/document", "mean_llm_calls"), ("Mean tool calls/document", "mean_tool_calls"),
-            ("Mean tokens/document", "mean_tokens"),
+        {
+            "Metric": label,
+            "Value": _format_metric(snap[key], as_percentage=pct) if snap[key] is not None else "unavailable",
+        }
+        for label, key, pct in [
+            ("Completion rate", "completion_rate", True), ("Checks needing review", "review_rate", True),
+            ("Follow-up resolution rate", "followup_resolution_rate", True),
+            ("Budget exhaustion rate", "budget_exhaustion_rate", True),
+            ("Mean LLM calls/document", "mean_llm_calls", False), ("Mean tool calls/document", "mean_tool_calls", False),
+            ("Mean tokens/document", "mean_tokens", False),
         ]
     ])
     st.caption(
@@ -174,18 +84,6 @@ def render(store: Any, st: Any) -> None:
         "Local $0 means no API charge; hardware and energy costs are not measured."
         f" Cost average covers {snap['priced_runs']} priced runs out of {snap['runs']}."
     )
-
-    st.header("RAG quality: judged versus computed")
-    st.caption("No score is fabricated for failed runs. Reference-based metrics need reviewed labels for this run; "
-               "faithfulness can be judged only when completed findings and source evidence exist. "
-               "Use a local judge for confidential documents.")
-    st.caption(
-        "RAGAS is LLM-judged, not ground truth. Exact quality scores require saved evaluations "
-        "against independently labeled evidence or answers. "
-        f"Judged values are computed on demand by `{COMPUTE_HINT}` and cached per run -- a judge "
-        "pass costs more model calls than the analysis itself, so it never runs on a dashboard rerun."
-    )
-    st.table(quality_comparisons(store, snap))
 
     if alerts:
         st.subheader("Alerts")
@@ -197,6 +95,13 @@ def render(store: Any, st: Any) -> None:
             )
 
     st.header("Quality (historical)")
+    shift = snap["state_distribution_drift"]
+    baseline = snap["state_distribution_baseline"]
+    st.metric("State-distribution shift", f"{shift * 100:.1f} pp" if shift is not None else "unavailable")
+    st.caption(
+        f"Last 7 days vs preceding 7 days: {baseline['current_runs']} vs {baseline['baseline_runs']} "
+        f"eligible runs. {baseline['reason']}"
+    )
     if bins:
         st.subheader("Confidence calibration")
         st.table(bins)
@@ -212,4 +117,4 @@ def render(store: Any, st: Any) -> None:
         st.caption("No runs recorded yet.")
 
 
-__all__ = ["quality_comparisons", "render"]
+__all__ = ["render"]

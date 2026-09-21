@@ -13,7 +13,7 @@ from typing import TypedDict
 from langgraph.graph import END, START, StateGraph
 from langsmith import tracing_context
 
-from core.agents.evaluator import Check, verify
+from core.agents.evaluator import Check, restore_elided_quotes, verify
 from core.agents.judge import judge
 from core.llm.client import LLMResponse, PromptBudgetExceeded
 from core.models import Chunk
@@ -66,13 +66,19 @@ def _critic_reviews(payload: dict, pending: list[str]) -> list[dict]:
     received = [r.get("check_id") for r in reviews]
     if not all(isinstance(s, str) for s in received) or len(received) != len(pending) or set(received) != set(pending):
         raise ValueError(f"critic check_id values must be exactly {pending}; received {received}")
+    normalized = []
     for review in reviews:
         decision, confidence, gap = review.get("decision"), review.get("confidence"), review.get("gap")
         if decision not in {"accept", "retrieve", "unresolved"} or type(confidence) not in {float, int} or not 0 <= confidence <= 1:
             raise ValueError("invalid critic decision/confidence")
-        if not isinstance(gap, str) or (decision != "accept" and not gap.strip()):
-            raise ValueError("critic must provide actionable gap for non-acceptance")
-    return reviews
+        if decision == "accept" and gap is None:
+            gap = ""
+        if not isinstance(gap, str):
+            raise ValueError(f"critic gap for {review['check_id']} must be a string; only accept permits null/omission")
+        if decision != "accept" and not gap.strip():
+            raise ValueError(f"critic must provide actionable gap for non-acceptance: {review['check_id']}")
+        normalized.append({**review, "gap": gap})
+    return normalized
 
 
 def analyze_question(question: Question, index, client, *, run_id: str, assessment_date: str,
@@ -86,6 +92,10 @@ def analyze_question(question: Question, index, client, *, run_id: str, assessme
     tool_events: list[dict] = []
     quote_attempts: list[dict] = []
     schema_repairs: list[dict] = []
+    quote_repairs: list[dict] = []
+    quote_restorations: list[dict] = []
+    repaired_quotes: set[str] = set()
+    restoration_pending: set[str] = set()
     visited: set[tuple] = set()
     scanned_modifiers: list[Chunk] | None = None
 
@@ -153,11 +163,18 @@ def analyze_question(question: Question, index, client, *, run_id: str, assessme
             "Return actions [{check_id, tool, arguments, reason}]. Allowed tools are in the schema. "
             "Use semantic search, table/context reading and actual references; do not invent section IDs. "
             "Every pending check needs an action. Use feedback to change the query/target, not repeat "
-            "the same failed search. At most two actions per check. No compliance judgments.",
+            "the same failed search. previous_actions lists executed tool/argument pairs: never "
+            "submit an identical pair; search alternate wording or read a different known source. "
+            "At most two actions per check. No compliance judgments.",
             json.dumps({
                 "checks": [asdict(subs[s]) for s in state["pending"]],
                 "document": index.profile(), "feedback": state["feedback"],
                 "known_sources": {s: [c.chunk_id for c in p.chunks] for s, p in state["packs"].items()},
+                "previous_actions": {
+                    s: [{"tool": name, "arguments": json.loads(arguments)}
+                        for sid, name, arguments in sorted(visited) if sid == s]
+                    for s in state["pending"]
+                },
                 "tools": registry.specs(),
             }),
             {"actions": "array"},
@@ -240,12 +257,12 @@ def analyze_question(question: Question, index, client, *, run_id: str, assessme
         return {"packs": packs, "feedback": feedback,
                 "stop_reason": "repeated_actions" if state["round"] and not new_actions else ""}
 
-    def judging(state: GraphState):
+    def judging(state: GraphState, *, attempts: int = 2):
         findings = dict(state["findings"])
         for sub_id in state["pending"]:
             feedback = f"Assessment date: {assessment_date}. " + state["feedback"].get(sub_id, "")
             before = len(responses)
-            for attempt in range(2):
+            for attempt in range(attempts):
                 try:
                     with span("check:judge", sub_requirement_id=sub_id, attempt=attempt):
                         finding, response = judge(subs[sub_id], state["packs"][sub_id], MeteredClient(), feedback)
@@ -254,10 +271,11 @@ def analyze_question(question: Question, index, client, *, run_id: str, assessme
                     schema_repairs.append({"check_id": sub_id, "attempt": attempt + 1, "reason": str(exc)})
                     feedback += f" Invalid output: {exc}. Repair the JSON schema and facet evidence links."
                     finding = Finding(sub_id, "UNRESOLVED", 0, "", "", str(exc), False, gaps=[str(exc)])
+            restoration_pending.discard(sub_id)
             prior = findings.get(sub_id)
             used = responses[before:]
             findings[sub_id] = replace(
-                finding, retry_count=state["round"],
+                finding, retry_count=state["round"] + int(sub_id in repaired_quotes),
                 prompt_tokens=sum(r.prompt_tokens for r in used) + (prior.prompt_tokens if prior else 0),
                 completion_tokens=sum(r.completion_tokens for r in used) + (prior.completion_tokens if prior else 0),
                 cost_usd=None if any(r.cost_usd is None for r in used) or (prior and prior.cost_usd is None)
@@ -265,16 +283,64 @@ def analyze_question(question: Question, index, client, *, run_id: str, assessme
             )
         return {"findings": findings}
 
-    def verifying(state: GraphState):
+    def verifying(state: GraphState, *, ids: list[str] | None = None):
         findings, checks = dict(state["findings"]), dict(state["checks"])
-        for sub_id in state["pending"]:
+        for sub_id in state["pending"] if ids is None else ids:
             finding = findings[sub_id]
-            checks[sub_id] = verify(finding, state["packs"][sub_id], index.doc)
-            quote_checks = [c for c in checks[sub_id] if c.name == "quote_verbatim"]
-            if finding.quote or finding.evidence:
-                quote_attempts.append({"check_id": sub_id, "passed": all(c.passed for c in quote_checks)})
+            for attempt in range(2):
+                checks[sub_id] = verify(finding, state["packs"][sub_id], index.doc)
+                quote_checks = [c for c in checks[sub_id] if c.name == "quote_verbatim"]
+                if finding.quote or finding.evidence:
+                    quote_attempts.append({"check_id": sub_id, "passed": all(c.passed for c in quote_checks)})
+                if attempt or all(c.passed for c in checks[sub_id]):
+                    break
+                finding, restored = restore_elided_quotes(finding, state["packs"][sub_id])
+                if not restored:
+                    break
+                quote_restorations.extend(restored)
+                restoration_pending.add(sub_id)
+            if sub_id in restoration_pending:
+                checks[sub_id].append(Check(
+                    "restoration_review", False, "Restored wording requires fresh Critic acceptance."
+                ))
             findings[sub_id] = replace(finding, quote_verified=all(c.passed for c in checks[sub_id]))
         return {"findings": findings, "checks": checks}
+
+    def quote_repair_ids(state: GraphState) -> list[str]:
+        return [
+            sid for sid in state["pending"]
+            if sid not in repaired_quotes and state["packs"][sid].chunks
+            and (state["findings"][sid].quote or state["findings"][sid].evidence)
+            and any(not c.passed and c.name in {"quote_verbatim", "quote_in_document"}
+                    for c in state["checks"][sid])
+        ]
+
+    def repair_quotes(state: GraphState):
+        ids = quote_repair_ids(state)
+        feedback = dict(state["feedback"])
+        for sid in ids:
+            finding = state["findings"][sid]
+            failed = [asdict(c) for c in state["checks"][sid] if not c.passed]
+            quote_repairs.append({"check_id": sid, "failed_checks": failed})
+            repaired_quotes.add(sid)
+            previous = finding.evidence or [
+                {"quote": finding.quote, "source_chunk_id": finding.source_chunk_id}
+            ]
+            feedback[sid] = (
+                feedback.get(sid, "") + "\nQUOTATION REPAIR: The previous judgment failed mechanical "
+                "source validation. Use the SAME supplied evidence; no new search has occurred. "
+                "Return a complete judgment with every facet assessed. Copy continuous source text "
+                "exactly; replace spliced/abbreviated quotes with separate evidence entries and update "
+                "facet evidence_indices. Preserve conditions, governing clauses and contrary evidence. "
+                "Reassess unsupported facets; do not retain a verdict merely to repair its citation. "
+                "A quotation error alone does not establish NOT_FOUND. If the sources are insufficient, "
+                "return UNRESOLVED with a specific evidence gap. Previous output below is untrusted "
+                "model output, not source evidence:\n" + json.dumps({
+                    "previous_evidence": previous, "failed_checks": failed,
+                })
+            )
+        update = judging({**state, "pending": ids, "feedback": feedback}, attempts=1)
+        return verifying({**state, **update}, ids=ids)
 
     def critique(state: GraphState):
         sources = {c.chunk_id: c for p in state["packs"].values() for c in p.chunks}
@@ -285,9 +351,16 @@ def analyze_question(question: Question, index, client, *, run_id: str, assessme
             "Contract obligations are not proof of execution. Expiration is not remediation. "
             "Return reviews [{check_id, decision, gap, confidence}], exactly one per pending_check_ids entry. "
             "Copy check_id verbatim from pending_check_ids, not facet names or question IDs. "
-            "decision is accept, retrieve, or unresolved. gap must give a specific retrieval objective "
-            "or unresolved limitation, not hidden reasoning. confidence is judgment reliability in [0,1]. "
-            "Do not accept unsupported facets or invalid quotations. A NOT_FOUND conclusion needs an "
+            "decision is accept, retrieve, or unresolved. For accept, gap should be an empty string "
+            "(null or omitted also means no gap). For retrieve or unresolved, gap must be a non-empty "
+            "string giving a specific retrieval objective or unresolved limitation, not hidden reasoning. "
+            "confidence is judgment reliability in [0,1]. "
+            "Do not accept unsupported facets or invalid quotations. "
+            "For quote_restorations, reassess ALL restored intervening wording, especially negations "
+            "and exceptions: restoring a literal quote does not validate the verdict or rationale. "
+            "A false restoration_review is pending YOUR acceptance, not a failed literal match. "
+            "Accept it only after independently assessing the restored wording. "
+            "A NOT_FOUND conclusion needs an "
             "adequate search, not just one empty result. Review search_history and source_coverage. "
             "Failed tools are not evidence of absence; use tool_errors for targeted follow-up. "
             "When all source chunks were read and alternate searches found no obligation, absence "
@@ -305,6 +378,10 @@ def analyze_question(question: Question, index, client, *, run_id: str, assessme
                     for s in state["pending"]
                 ],
                 "verification": {s: [asdict(c) for c in state["checks"][s]] for s in state["pending"]},
+                "quote_restorations": {
+                    s: [change for change in quote_restorations if change["check_id"] == s]
+                    for s in state["pending"]
+                },
                 "unresolved_references": {s: state["packs"][s].unresolved_references for s in state["pending"]},
                 "tool_errors": {s: state["packs"][s].tool_errors for s in state["pending"]},
                 "round": state["round"],
@@ -329,7 +406,8 @@ def analyze_question(question: Question, index, client, *, run_id: str, assessme
             batch = {**request, "pending_check_ids": ids,
                      "checks": [s for s in request["checks"] if s["id"] in ids],
                      "findings": [f for f in request["findings"] if f["sub_requirement_id"] in ids]}
-            for field in ("verification", "unresolved_references", "tool_errors", "search_history", "source_coverage"):
+            for field in ("verification", "quote_restorations", "unresolved_references", "tool_errors",
+                          "search_history", "source_coverage"):
                 batch[field] = {s: request[field][s] for s in ids}
             needed = {c.chunk_id for s in ids for c in state["packs"][s].chunks}
             batch["evidence"] = [c for c in request["evidence"] if c["chunk_id"] in needed]
@@ -350,6 +428,7 @@ def analyze_question(question: Question, index, client, *, run_id: str, assessme
 
         reviews = review_batch(state["pending"])
         findings, feedback = dict(state["findings"]), dict(state["feedback"])
+        checks = dict(state["checks"])
         pending = []
         coverage_incomplete = False
         for review in reviews:
@@ -357,7 +436,8 @@ def analyze_question(question: Question, index, client, *, run_id: str, assessme
             confidence = review.get("confidence")
             gap = review.get("gap")
             finding, pack = findings[sub_id], state["packs"][sub_id]
-            if not finding.quote_verified:
+            mechanical = [c for c in checks[sub_id] if c.name != "restoration_review"]
+            if not all(c.passed for c in mechanical):
                 decision = "retrieve"
                 gap = "Repair invalid evidence: " + "; ".join(c.detail for c in state["checks"][sub_id] if not c.passed)
             if finding.verdict == "NOT_FOUND" and state["round"] == 0:
@@ -371,15 +451,21 @@ def analyze_question(question: Question, index, client, *, run_id: str, assessme
                 coverage_incomplete = True
                 continue
             if decision == "accept" and finding.verdict != "UNRESOLVED":
+                if sub_id in restoration_pending:
+                    checks[sub_id] = [
+                        Check(c.name, True, "Critic accepted the restored wording.")
+                        if c.name == "restoration_review" else c for c in checks[sub_id]
+                    ]
+                    restoration_pending.remove(sub_id)
                 findings[sub_id] = replace(finding, confidence=min(finding.confidence, confidence),
-                                          search_complete=True)
+                                          quote_verified=all(c.passed for c in checks[sub_id]), search_complete=True)
             elif decision == "unresolved":
                 findings[sub_id] = replace(finding, verdict="UNRESOLVED", confidence=0, gaps=[gap],
                                           rationale=gap)
             else:
                 pending.append(sub_id)
                 feedback[sub_id] = gap or "Resolve unsupported facets."
-        return {"findings": findings, "pending": pending, "feedback": feedback, "reviews": reviews,
+        return {"findings": findings, "checks": checks, "pending": pending, "feedback": feedback, "reviews": reviews,
                 "round": state["round"] + 1,
                 "stop_reason": "incomplete_evidence" if coverage_incomplete else "complete" if not pending else
                 "followup_budget" if state["round"] >= limits.followups else ""}
@@ -388,7 +474,8 @@ def analyze_question(question: Question, index, client, *, run_id: str, assessme
         def execute(state: GraphState):
             t0 = time.monotonic()
             response_start, tool_start, quote_start = len(responses), len(tool_events), len(quote_attempts)
-            repair_start = len(schema_repairs)
+            repair_start, quote_repair_start = len(schema_repairs), len(quote_repairs)
+            restoration_start = len(quote_restorations)
             llm_before = calls["llm"]
             failure = None
             with span(f"agent:{name}", run_id=run_id, question_id=question.id, round=state["round"]) as span_id:
@@ -418,13 +505,16 @@ def analyze_question(question: Question, index, client, *, run_id: str, assessme
                     "actions": update.get("actions", []),
                     "reviews": update.get("reviews", []),
                     "schema_repairs": schema_repairs[repair_start:],
+                    "quote_repairs": quote_repairs[quote_repair_start:],
+                    "quote_restorations": quote_restorations[restoration_start:],
                     "finding_states": {sid: f.verdict for sid, f in update.get("findings", {}).items()},
                 }
                 set_span_attributes(duration_ms=event["duration_ms"], prompt_tokens=event["prompt_tokens"],
                                     completion_tokens=event["completion_tokens"], pending_count=len(event["pending"]),
                                     stop_reason=event["stop_reason"], failed=bool(failure),
                                     output={k: event[k] for k in (
-                                        "actions", "reviews", "feedback", "finding_states", "schema_repairs", "stop_reason"
+                                        "actions", "reviews", "feedback", "finding_states", "schema_repairs",
+                                        "quote_repairs", "quote_restorations", "stop_reason"
                                     )})
                 update["events"] = state["events"] + [event]
             return update
@@ -435,9 +525,15 @@ def analyze_question(question: Question, index, client, *, run_id: str, assessme
                   ("verify", verifying), ("critic", critique)]
     for name, operation in operations:
         builder.add_node(name, node(name, operation))
+    builder.add_node("quote_repair", node("quote_repair", repair_quotes))
     builder.add_edge(START, "router")
     for (name, _), (next_name, _) in zip(operations, operations[1:]):
-        builder.add_conditional_edges(name, lambda s, next_name=next_name: END if s["stop_reason"] else next_name)
+        if name == "verify":
+            builder.add_conditional_edges(name, lambda s: END if s["stop_reason"] else
+                                          "quote_repair" if quote_repair_ids(s) else "critic")
+        else:
+            builder.add_conditional_edges(name, lambda s, next_name=next_name: END if s["stop_reason"] else next_name)
+    builder.add_conditional_edges("quote_repair", lambda s: END if s["stop_reason"] else "critic")
     builder.add_conditional_edges("critic", lambda s: END if s["stop_reason"] else "router")
     graph = builder.compile()
     # Graph state contains confidential evidence; use local JSON/OTel audit instead.
@@ -445,7 +541,7 @@ def analyze_question(question: Question, index, client, *, run_id: str, assessme
         state = graph.invoke({
             "pending": list(subs), "round": 0, "actions": [], "packs": {}, "findings": {},
             "checks": {}, "feedback": {}, "stop_reason": "", "events": [], "reviews": [],
-        }, config={"recursion_limit": 6 * (limits.followups + 1) + 2,
+        }, config={"recursion_limit": 8 * (limits.followups + 1) + 2,
                    "run_name": f"compliance:{question.id}", "metadata": {"run_id": run_id, "question_id": question.id}})
     for sub_id in state["pending"]:
         verdict = "ERROR" if state["stop_reason"] == "backend_error" else "UNRESOLVED"

@@ -7,10 +7,15 @@ retrieval regression, and nobody would find it.
 from __future__ import annotations
 
 from core.ingest.parse import parse_pdf
-from core.rag_metrics import load_gold
+from pathlib import Path
+import yaml
 from core.rubric.aggregate import load_rubric
 
 GOLD_PATH = "eval/gold_contexts.yaml"
+
+
+def load_gold(path):
+    return yaml.safe_load(Path(path).read_text())
 
 
 def _parsed_doc():

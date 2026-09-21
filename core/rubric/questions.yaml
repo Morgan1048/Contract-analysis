@@ -1,0 +1,64 @@
+{
+  "questions": [
+    {
+      "id": "Q1",
+      "title": "Password Management",
+      "text": "Password Management. The contract must require a documented password standard covering password length/strength, prohibition of default and known-compromised passwords, secure storage (no plaintext; salted hashing if stored), brute-force protections (lockout/rate limiting), prohibition on password sharing, vaulting of privileged credentials/recovery codes, and time-based rotation for break-glass credentials. Based on the contract language and exhibits, what is the compliance state for Password Management?",
+      "sub_requirements": [
+        {"id": "P1", "text": "documented password standard covering length and strength", "facets": ["documented standard", "password length", "password strength"], "guidance": "Do not invent a minimum length."},
+        {"id": "P2", "text": "prohibition of default and known-compromised passwords", "facets": ["default passwords prohibited", "known-compromised passwords prohibited"]},
+        {"id": "P3", "text": "secure password storage with no plaintext and salted hashing if stored", "facets": ["no plaintext passwords", "salted hashing if passwords are stored"], "guidance": "Preserve the if-stored condition; non-applicability requires explicit evidence."},
+        {"id": "P4", "text": "brute-force protection with lockout or rate limiting", "facets": ["brute-force protection"], "guidance": "Lockout or rate limiting suffices; do not require both or invent numerical thresholds."},
+        {"id": "P5", "text": "prohibition on password sharing", "facets": ["password sharing prohibited"]},
+        {"id": "P6", "text": "vaulting of privileged credentials and recovery codes", "facets": ["privileged credentials vaulted", "recovery codes vaulted"]},
+        {"id": "P7", "text": "time-based rotation for break-glass credentials", "facets": ["time-based break-glass credential rotation"], "guidance": "Do not import a rotation interval from a sample contract."}
+      ]
+    },
+    {
+      "id": "Q2",
+      "title": "IT Asset Management",
+      "text": "IT Asset Management. The contract must require an in-scope asset inventory (including cloud accounts/subscriptions, workloads, databases, security tooling), define minimum inventory fields, require at least quarterly reconciliation/review, and require secure configuration baselines with drift remediation and prohibition of insecure defaults. Based on the contract language and exhibits, what is the compliance state for IT Asset Management?",
+      "sub_requirements": [
+        {"id": "A1", "text": "in-scope asset inventory including cloud accounts/subscriptions, workloads, databases, and security tooling", "facets": ["cloud accounts/subscriptions inventoried", "workloads inventoried", "databases inventoried", "security tooling inventoried"]},
+        {"id": "A2", "text": "minimum asset inventory fields defined", "facets": ["minimum inventory fields defined"], "guidance": "Do not impose the sample contract's field list."},
+        {"id": "A3", "text": "asset inventory reconciliation or review at least quarterly", "facets": ["inventory reconciliation/review", "at least quarterly frequency"]},
+        {"id": "A4", "text": "secure configuration baselines, drift remediation, and no insecure defaults", "facets": ["secure configuration baselines", "configuration drift remediation", "insecure defaults prohibited"]}
+      ]
+    },
+    {
+      "id": "Q3",
+      "title": "Security Training & Background Checks",
+      "text": "Security Training & Background Checks. The contract must require security awareness training on hire and at least annually, and background screening for personnel with access to Company Data to the extent permitted by law, including maintaining a screening policy and attestation/evidence. Based on the contract language and exhibits, what is the compliance state for Security Training and Background Checks?",
+      "sub_requirements": [
+        {"id": "T1", "text": "security awareness training on hire", "facets": ["security awareness training on hire"]},
+        {"id": "T2", "text": "security awareness training at least annually", "facets": ["security awareness training at least annually"]},
+        {"id": "T3", "text": "background screening for personnel with access to Company Data to the extent permitted by law", "facets": ["background screening required", "covers personnel with Company Data access"], "guidance": "Preserve the lawful-screening qualification."},
+        {"id": "T4", "text": "maintaining a background screening policy plus attestation or evidence", "facets": ["screening policy maintained", "screening attestation/evidence maintained"]}
+      ]
+    },
+    {
+      "id": "Q4",
+      "title": "Data in Transit Encryption",
+      "text": "Data in Transit Encryption. The contract must require encryption of Company Data in transit using TLS 1.2+ (preferably TLS 1.3 where feasible) for Company-to-Service traffic, administrative access pathways, and applicable Service-to-Subprocessor transfers, with certificate management and avoidance of insecure cipher suites. Based on the contract language and exhibits, what is the compliance state for Data in Transit Encryption?",
+      "sub_requirements": [
+        {"id": "E1", "text": "TLS 1.2 or higher for Company Data in transit", "facets": ["TLS 1.2 or higher required"], "guidance": "TLS 1.3 where feasible is preferred, not mandatory."},
+        {"id": "E2", "text": "Company-to-Service traffic encryption using TLS 1.2 or higher", "facets": ["Company-to-Service traffic encrypted", "qualifying TLS baseline applies to this traffic"]},
+        {"id": "E3", "text": "administrative access pathway encryption using TLS 1.2 or higher", "facets": ["administrative access encrypted", "qualifying TLS baseline applies to this pathway"]},
+        {"id": "E4", "text": "applicable Service-to-Subprocessor transfer encryption using TLS 1.2 or higher", "facets": ["applicable Service-to-Subprocessor transfers encrypted", "qualifying TLS baseline applies to these transfers"], "guidance": "Non-applicability needs affirmative evidence, not silence."},
+        {"id": "E5", "text": "certificate management and avoidance of insecure cipher suites", "facets": ["certificate management required", "insecure cipher suites avoided"]}
+      ]
+    },
+    {
+      "id": "Q5",
+      "title": "Network Authentication & Authorization Protocols",
+      "text": "Network Authentication & Authorization Protocols. The contract must specify the authentication mechanisms (e.g., SAML SSO for users, OAuth/token-based for APIs), require MFA for privileged/production access, require secure admin pathways (bastion/secure gateway) with session logging, and require RBAC authorization. Based on the contract language and exhibits, what is the compliance state for Network Authentication and Authorization Protocols?",
+      "sub_requirements": [
+        {"id": "N1", "text": "authentication mechanisms specified for applicable access paths", "facets": ["authentication mechanisms specified"], "guidance": "SAML SSO and OAuth/token APIs are examples, not required protocol brands; assess applicable user and API access."},
+        {"id": "N2", "text": "MFA for privileged and production access", "facets": ["privileged access requires MFA", "production access requires MFA"]},
+        {"id": "N3", "text": "secure administrative pathway using a bastion or secure gateway", "facets": ["secure administrative access pathway"], "guidance": "Do not require both a bastion and a gateway."},
+        {"id": "N4", "text": "administrative access session logging", "facets": ["administrative sessions logged"], "guidance": "Unrelated application logs do not suffice."},
+        {"id": "N5", "text": "role-based access control RBAC authorization", "facets": ["RBAC authorization required"]}
+      ]
+    }
+  ]
+}

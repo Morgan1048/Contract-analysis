@@ -78,10 +78,14 @@ def to_compliance_json(result: QuestionResult, index: Any | None, *,
             if not quote or not source or (quote, source) in seen:
                 continue
             chunk = chunks.get(source) if chunks is not None else None
-            if chunks is not None and chunk is None:
-                continue
+            # The run's own saved evidence is source-backed, so it still grounds
+            # a label when the live index no longer holds that chunk (a result
+            # rendered against a re-parsed or different document). Only a source
+            # neither the index nor the snapshot knows is dropped.
             if chunk is None and evidence_snapshot and source in evidence_snapshot:
                 chunk = Chunk(**evidence_snapshot[source])
+            if chunks is not None and chunk is None:
+                continue
             label = reference_label(chunk) if chunk else reference_label_from_chunk_id(source)
             citations.append(Citation(quote, label, source).to_dict())
             seen.add((quote, source))

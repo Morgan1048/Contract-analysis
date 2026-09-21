@@ -1,0 +1,36 @@
+[project]
+name = "contract-analyzer"
+version = "0.1.0"
+description = "Source-grounded contract analysis with LangGraph, local audit, and Streamlit"
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph>=1.0,<2",
+    "openapi-spec-validator==0.7.2",
+    "pdfplumber==0.11.10",
+    "pyyaml==6.0.2",
+    "streamlit==1.64.0",
+    "opentelemetry-sdk>=1.27,<2",
+    "opentelemetry-exporter-otlp-proto-http>=1.27,<2",
+    "certifi>=2024.2.2",
+    "python-dotenv>=1.0,<2",
+    "tiktoken>=0.11,<1",
+    "fastembed>=0.7,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.3.4",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: tests that require a reachable backend; skip when unavailable",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["core*", "eval*"]

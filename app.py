@@ -80,7 +80,7 @@ def _analyze_uploaded_file(uploaded_file, *, allow_remote: bool = False) -> None
                         else:
                             next_attempt = (f"retry {update.retry}/{update.max_retries}"
                                             if update.retry else "the next request")
-                            label = (f"{update.provider} {update.reason} (HTTP {update.http_status or '-'}): "
+                            label = (f"API {update.reason.replace('_', ' ')} (HTTP {update.http_status or '-'}): "
                                      f"waiting {update.remaining_s:.0f}s before {next_attempt}. "
                                      "Analysis is still running.")
                     else:
@@ -129,7 +129,7 @@ def _chat_context() -> dict:
 
     store = _store()
     snap = snapshot(store)
-    alerts = evaluate_thresholds(snap, calibration_bins=None)
+    alerts = evaluate_thresholds(snap)
     if alerts:
         context["alerting_kpis"] = {
             alert.name: {"value": alert.value, "threshold": alert.threshold, "severity": alert.severity}

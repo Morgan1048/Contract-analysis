@@ -1,0 +1,26 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+.index/
+eval/fixtures/
+
+# Real and demo run history databases; data/demo.db is written only by
+# eval/seed_demo.py and must never be committed alongside real data/runs.db.
+data/*.db
+data/*.db-*
+
+# Uploaded contracts and assignment PDFs are confidential, not distributable fixtures.
+*.pdf
+
+# Z4: real secrets live only here, never committed. See .env.example.
+.env
+.env.*
+!.env.example
+logs/
+
+# Per-run RAGAS reports written by eval/run_ragas.py (derived from a real
+# contract analysis; the assignment material is CONFIDENTIAL).
+data/ragas/
